@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import httpx
 
@@ -46,7 +47,8 @@ class USDAFoodDataClient:
                 self.last_status = response.status_code
                 self.last_url = str(response.request.url)
                 if self.debug:
-                    print(f"[DEBUG][USDA] status={self.last_status} url={self.last_url} query='{query}'")
+                    safe_url = _redact_query_params(self.last_url, {"api_key"})
+                    print(f"[DEBUG][USDA] status={self.last_status} url={safe_url} query='{query}'")
                 response.raise_for_status()
                 data: dict[str, Any] = response.json()
             except httpx.HTTPStatusError as exc:
@@ -105,3 +107,13 @@ def _extract_nutrient(nutrients: list[dict[str, Any]], names: set[str]) -> float
             except (TypeError, ValueError):
                 return None
     return None
+
+
+def _redact_query_params(url: str, keys: set[str]) -> str:
+    try:
+        split = urlsplit(url)
+        pairs = parse_qsl(split.query, keep_blank_values=True)
+        safe_pairs = [(k, "***" if k in keys else v) for k, v in pairs]
+        return urlunsplit((split.scheme, split.netloc, split.path, urlencode(safe_pairs), split.fragment))
+    except Exception:
+        return url

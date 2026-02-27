@@ -56,10 +56,16 @@ class AssistantService:
 
         if mode == "memory":
             if not session_state["products"]:
-                return "[source: memory]\n\nI do not have earlier product queries in this chat yet."
-            lines = ["[source: memory]", "", "Session summary:"]
-            lines.append("Products: " + ", ".join(session_state["products"]))
-            lines.append("Last goal: " + session_state["goal"])
+                return (
+                    "[source: memory]\n\n"
+                    "I do not have earlier product queries in this chat yet. "
+                    "If you want, I can start by comparing two products or analyzing one product label."
+                )
+            lines = ["[source: memory]", "", "Here is what we have covered so far:"]
+            lines.append("- Products discussed: " + ", ".join(session_state["products"]))
+            lines.append("- Last active goal: " + session_state["goal"])
+            lines.append("")
+            lines.append("If you want, I can continue with that same goal or switch to a new one.")
             return "\n".join(lines)
 
         if mode == "correction" and allow_correction_retry:
@@ -157,7 +163,11 @@ class AssistantService:
                 context=compare_context,
                 history=history,
             )
-            return f"[source: {self.chat.last_source} + usda-compare]\n\n{table}\n\n{match_block}\n\n{answer}"
+            answer = self._ensure_natural_answer(answer, best_rows, goal, is_compare=True)
+            compare_source = f"{self.chat.last_source} + usda-compare"
+            if self.chat.last_source != "llm" and self.chat.last_error:
+                compare_source += f" ({self.chat.last_error})"
+            return f"[source: {compare_source}]\n\n{answer}\n\n{table}\n\n{match_block}"
 
         products, source, source_error, source_status = await self._search_usda(search_query, page_size=12)
         products, match_meta = self._filter_relevant_products(search_query, products)
@@ -233,7 +243,8 @@ class AssistantService:
                 f"- explanation: {match_meta['explanation']}\n"
                 f"- source: {source}"
             )
-            return f"[source: llm + usda]\n\n{table}\n\n{match_block}\n\n{answer}"
+            answer = self._ensure_natural_answer(answer, single_best, goal, is_compare=False)
+            return f"[source: llm + usda]\n\n{answer}\n\n{table}\n\n{match_block}"
 
         details = f" ({self.chat.last_error})" if self.chat.last_error else ""
         if self.debug:
@@ -263,7 +274,10 @@ class AssistantService:
 
     @staticmethod
     def _filter_relevant_products(query: str, products: list[FoodProduct]) -> tuple[list[FoodProduct], dict[str, str]]:
-        if not products:
+        sane_products = [p for p in products if AssistantService._is_reasonable_product(p)]
+        if not sane_products:
+            sane_products = products[:]
+        if not sane_products:
             return [], {"confidence": "low", "explanation": "no relevant product match"}
 
         q = (query or "").lower()
@@ -273,10 +287,10 @@ class AssistantService:
             q_tokens.extend(AssistantService._token_variants(tok))
         q_tokens = list(dict.fromkeys(q_tokens))
         if not q_tokens:
-            return products[:3], {"confidence": "low", "explanation": "query tokens too broad for strict filtering"}
+            return sane_products[:3], {"confidence": "low", "explanation": "query tokens too broad for strict filtering"}
 
         scored: list[tuple[int, FoodProduct]] = []
-        for p in products:
+        for p in sane_products:
             hay = f"{p.product_name} {p.brands} {p.ingredients_text}".lower()
             score = 0
             if q in hay:
@@ -292,10 +306,12 @@ class AssistantService:
 
         if not scored:
             # For generic queries (e.g., apples/oranges), keep top raw results instead of emptying out.
-            return products[:3], {"confidence": "low", "explanation": "fallback to broad USDA search results"}
+            return sane_products[:3], {"confidence": "low", "explanation": "fallback to broad USDA search results"}
 
         scored.sort(key=lambda x: x[0], reverse=True)
         best_score = scored[0][0]
+        min_score = max(2, best_score - 3)
+        scored = [x for x in scored if x[0] >= min_score]
         confidence = "high" if best_score >= 8 else "medium" if best_score >= 4 else "low"
         explanation = "exact keyword match" if best_score >= 8 else "partial keyword match"
         return [p for _, p in scored], {"confidence": confidence, "explanation": explanation}
@@ -366,6 +382,14 @@ class AssistantService:
             return "n/a"
         return f"{value:.1f}"
 
+    @staticmethod
+    def _is_reasonable_product(item: FoodProduct) -> bool:
+        # USDA occasionally returns malformed/odd entries with unrealistic energy values.
+        # Keep broad ranges to avoid dropping valid foods while filtering clear outliers.
+        if item.energy_kcal_100g is None:
+            return True
+        return 0.0 <= float(item.energy_kcal_100g) <= 900.0
+
     def _build_session_state(self, history: list[dict] | None) -> dict[str, object]:
         products = self._recall_product_queries(history)
         goal = ""
@@ -380,6 +404,36 @@ class AssistantService:
                 if goal:
                     break
         return {"products": products, "goal": goal or "lower calories"}
+
+    def _ensure_natural_answer(
+        self,
+        answer: str,
+        rows: list[tuple[str, FoodProduct]],
+        goal: str,
+        is_compare: bool,
+    ) -> str:
+        text = (answer or "").strip()
+        if text and not text.startswith("OpenAI request failed") and not text.startswith("I couldn't generate"):
+            return text
+        if not rows:
+            return "I could not generate a detailed recommendation. I found limited catalog data for your request."
+
+        if is_compare and len(rows) >= 2:
+            reverse = goal == "higher protein"
+            ranked = sorted(rows, key=lambda x: self._metric_value(x[1], goal), reverse=reverse)
+            best_query, best_item = ranked[0]
+            second_query, second_item = ranked[1]
+            return (
+                f"For the goal '{goal}', the better match appears to be **{best_item.product_name}** "
+                f"(query: {best_query}) over **{second_item.product_name}** (query: {second_query}). "
+                "See the table below for the numeric breakdown and data gaps."
+            )
+
+        query, item = rows[0]
+        return (
+            f"Here is the nutrition summary I found for **{item.product_name}** (query: {query}). "
+            f"Given your goal '{goal}', review calories, sugar, protein, fat, and salt in the table below."
+        )
 
     @staticmethod
     def _session_state_text(session_state: dict[str, object]) -> str:
